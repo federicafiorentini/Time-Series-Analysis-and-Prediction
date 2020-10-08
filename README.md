@@ -12,5 +12,6 @@ Per realizzare la previsione viene utilizzato un Dataset messo a disposizione ch
 
 L'obiettivo dell'analisi consiste nel prevedere l'andamento della serie temporale, ovvero l'andamento del prezzo giornaliero dell'energia elettrica, per quanto riguarda parte dell'anno successivo, dal 1° Gennaio 2019 al 30 Novembre 2019.
 
-![Cattura1](https://user-images.githubusercontent.com/49710127/95502601-56c87480-09aa-11eb-95c4-2dd588a016d2.PNG)
+![Cattura](https://user-images.githubusercontent.com/49710127/95502587-5334ed80-09aa-11eb-9da6-2c9484784fff.PNG)
+
 
