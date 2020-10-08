@@ -1,0 +1,1241 @@
+---
+title: "Forecasting"
+author: "Federica Fiorentini - 807124"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+
+```{r, include=T, warning=FALSE, message=FALSE}
+list.of.packages <- c("xts", "forecast", "tseries", "ggplot2", "urca", "tsoutliers", "fpp2", "timeSeries", "KFAS", "tidyverse", "glue", "forcats", "timetk", "tidyquant", "tibbletime", "cowplot", "recipes", "rsample", "yardstick", "keras", "dplyr", "skmeans", "tsfknn")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+library(xts)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(urca)
+library(tsoutliers)
+library(fpp2)
+library(timeSeries)
+library(KFAS)
+library(tidyverse)
+library(glue)
+library(forcats)
+library(timetk)
+library(tidyquant)
+library(tibbletime)
+library(cowplot)
+library(recipes)
+library(rsample)
+library(yardstick) 
+library(keras)
+library(forecast)
+library(dplyr)
+library(skmeans)
+library(tsfknn)
+```
+
+
+# Introduzione, dati e pre-processing
+
+Lo scopo del progetto è di prevedere l'andamento della serie storica in considerazione riguardante i prezzi dell'energia elettrica. I dati forniti si riferiscono ad un periodo dal 1-gen-2010 al 31-dec-2018 e sono aggregati a livello giornaliero. La previsione viene effettuata dal 1-gen-2019 al 30-nov-2019. 
+
+```{r, include=T, warning=FALSE, message=FALSE}
+#caricamento del dataset e trasformazione della variabile data in formato date
+df <- read.csv("C:/Users/FedericaFiorentini/Desktop/time_series_dataset.csv", sep=";")
+df$Data <- as.Date(df$Data)
+```
+
+Il dataset è costituito da due colonne: Data e Value, corrispondente al valore del prezzo dell'energia.
+
+```{r}
+plot(xts(df$value, df$Data, frequency = 7), main = 'Prezzi del mercato energetico')
+```
+
+Da una prima visualizzazione della serie storica emerge una possibile stagionalità settimanale, abbastanza prevedibile se si pensa al mercato di riferimento dei dati. Il processo, inoltre, sembra essere stazionario in varianza poiché, escludendo alcuni picchi, il sembra non si presentino particolari trend crescenti o decrescenti. I picchi possono risultare in corrispondenza di festività o del weekend, come detto in precedenza, oppure in presenza di outlier.
+
+Di seguito vengono effettuate alcune analisi per capire l'andamento della serie e i possibili cambiamenti durante la settimana.
+
+```{r}
+df$Giorno <- as.factor(strftime(df$Data, format = '%A'))
+ggplot(df, aes(Giorno, value)) + geom_boxplot() + xlab('Giorno')
+```
+
+Anche questo grafico conferma la differenza del consumo di energia elettrica tra i giorni della settimana. Mediamente, infatti, la domenica si rileva un consumo più basso così come il sabato, a differenza degli altri giorni in cui all'incirca mantiene lo stesso livello.
+Come evidenziano i boxplot, inoltre, sono presenti diversi outlier, di seguito analizzati. 
+
+```{r}
+outliers <- tsoutliers(df$value)
+n_out <- length(outliers$index)
+n_out
+```
+
+Il numero di outlier è relativamente basso, 26 pari allo 0.6% dell'intera serie storica. Tramite la funzione *tsclean*, quindi, vengono sostituiti i valori delle 26 osservazioni considerate outlier, imponendo come valori l'interpolazione lineare della serie. 
+
+```{r}
+df$value <- tsclean(df$value)
+```
+
+Per poter procedere con l'analisi è necessario trasformare il dataset in un oggetto ts e suddividere i dati in train e validation, in particolare utilizzando solamente l'ultimo anno a disposizione come validation set.
+
+```{r, include=T, warning=FALSE, message=FALSE}
+#trasformazione ts e split in train e validation
+df_ts = xts(df$value, order.by = df$Data)
+
+
+df_train <- df_ts["2010-01-01/2017-06-30"]
+df_validation <- df_ts["2017-07-01/2018-12-31"] #!è stato cambiato per provavalidation <- idata["2017-07-01/2018-12-31"]
+```
+
+
+```{r }
+#rappresentazione della serie suddivisa in train e validation
+df$Categoria <- ifelse(df$Data > "2017-06-30","validation", "train")
+ggplot(df, aes(x = Data,y = value)) +
+        geom_line(aes(colour = Categoria)) +
+  scale_color_manual(values = c("#C12869", "#C2DFFF")) +
+  theme_classic()
+```
+
+# Sviluppo'dei modelli
+
+Di seguito lo sviluppo di diversi modelli appartenenti a 3 categorie:
+
+  - Modelli **ARIMA** (AutoRegressive Integrated Moving Average);
+	- Modelli **UCM** (modelli a componenti non osservabili);
+	- **Modelli non-lineari** (ML)
+
+
+# ARIMA
+
+Per stimare i coefficienti del modello ARIMA è stata seguita la procedura di Box e Jenkins che prevede, inizialmente, l'analisi dei correlogrammi della serie per stimare i coefficienti stagionali e non sia della parte autoregressiva che quella a media mobile.
+
+```{r}
+#acf e pacf plot
+acf(df_train, lag.max = 150)  
+pacf(df_train, lag.max = 150)
+```
+Osservando i correlogrammi della serie, si osserva che l'ACF tende a zero molto lentamente. Si evince, inoltre, l'evidenza di picchi con cadenza settimanale e questo va a confermare la presenza di una leggera *non stazionarietà in media*. Si procede, quindi, con una differenziazione settimanale e, successivamente, con l'applicazione di un primo modello ARIMA. 
+
+```{r}
+#differenziazione settimanale
+df_train_diff7 <- diff(df_train,7)
+plot(df_train_diff7, main = "Serie Differenziata")
+```
+
+### ARIMA semplice
+
+Dal grafico, la serie sembra essere stazionaria in media poiché i valori oscillano tutti intorno allo zero. 
+Si procede come detto in precedenza al calcolo del modello:
+$$ARIMA (0,0,0) (1,1,1)_7$$
+Si pone il parametro lambda=auto per permettere di stimare il coefficiente utile alla trasformazione di Box-Cox per rendere la serie stazionaria in varianza. 
+
+```{r}
+#modello ARIMA
+mod_1 <- Arima(df_train_diff7, c(0,0,0), list(order = c(1,0,1), period = 7), lambda = "auto" )
+mod_1
+```
+
+Come suggerisce la procedura di Box e Jenkins, si effettua l'analisi dei residui del modello.
+
+```{r}
+Acf(mod_1$residuals, lag.max = 72)  
+Pacf(mod_1$residuals, lag.max = 72)
+```
+
+Dai correlogrammi dei residui, si nota che la PACF rimane significativa nei primi 6 ritardi. Si cerca il coefficiente della parte autoregressiva non stagionale testando 7 modelli di ordine da 0 a 6. Il modello migliore viene selezionato tramite il criterio dell'AIC, ovvero il modello che minimizza questo valore. Si preferisce non aumentare ancor di più il valore del coefficiente dell'AR (anche se in realtà al ritardo 7 rimane ancora significativo) perché, a fronte di un piccolo miglioramento del modello, si preferisce non appesantirlo con troppi coefficienti. Inoltre, la significatività del ritardo 7 potrebbe essere dovuta a rimanenze della componente stagionale. 
+
+```{r}
+#stima dei modelli ARIMA
+
+for (i in 0:6) {
+  mod <- Arima(df_train_diff7, c(i,0,0), list(order=c(1,0,1), period=7),lambda = "auto")
+  print(paste0("AR-", i," MA-0"," AIC: ",round(mod$aic)))
+}
+```
+
+Il modello migliore sembra essere 
+$$ ARIMA(6,0,0)(1,0,1)_7$$
+
+```{r}
+#stima del modello migliore
+best_mod = Arima(df_train, c(6,0,0), list(order=c(1,1,1), period=7),lambda = "auto")
+best_mod
+```
+
+```{r}
+#analisi dei residui
+Acf(best_mod$residuals, lag.max = 36)  
+Pacf(best_mod$residuals, lag.max = 36)
+```
+
+```{r}
+previsioni <- forecast::forecast(best_mod, h=549) 
+```
+
+
+```{r}
+#Previsioni rispetto ai valori reali
+graph_arima <- ggplot(ts(df_train["2010-01-01/2017-06-30"], start = 1, end = 2, frequency = frequency(df_train) )) +
+  autolayer(previsioni,series="Valori previsti") +
+  autolayer(ts(df_validation, start =length(df_train)+1, end = length(df_validation)+length(df_train)+1,frequency = frequency(df_validation)), series="Valori reali") +
+  scale_color_manual(values = c("#252850", "#C12869")) + 
+  theme_classic() +
+  xlab(" ") + 
+  ylab(" ") +
+  ggtitle("ARIMA")
+
+graph_arima
+```
+
+Dal grafico si osserva che i valori della previsione rispetto ai valori reali non sono ottimali. Questo perché il modello ARIMA non riesce a cogliere la multistagionalità intra annua e settimanale. Al modello, quindi, vengono aggiunti inizialmente solamente dei regressori sinusoidali che permettono di catturare la stagionalità intra-annua. In particolare, sono state considerate le prime 20 serie di regressori sinusoidali che permettono di stimare stagionalità lisce. La frequenza è pari a $2\pi/365.25$. Successivamente sono stati introdotti dei regressori dummy in prossimità delle feste italiane: Capodanno, Epifania, Pasqua, 25 Aprile, 1 Maggio, 2 Giugno, Ferragosto, Santi, Immacolata e Natale. 
+
+### ARIMA con regressori sinusoidali
+
+```{r}
+#creazione delle dummy
+freq <- outer(1:nrow(df)+334, 1:20)*2*pi/365.25 
+cs   <- cos(freq)                   
+colnames(cs) <- paste("cos", 1:20)
+si   <- sin(freq)                   
+colnames(si) <- paste("cos", 1:20)
+sin <- as.matrix(cbind(cs,si)) 
+
+#Modello con regressori sinosoidali
+best_mod_reg <- Arima(df_train, c(6,0,0), list(order = c(1,1,1), period = 7),xreg=sin[1:(length(df_train)),] )
+best_mod_reg
+```
+
+```{r, warning=FALSE}
+previsioni_reg <- forecast::forecast(best_mod_reg, h=549, 
+              xreg=sin[(length(df_train)+1):(length(df_train)+549),])
+```
+
+
+```{r}
+graph_reg <- ggplot(ts(df_train["2010-01-01/2017-06-30"], start = 1, end = 2, frequency = frequency(df_train) )) +
+  autolayer(previsioni_reg,series="Valori Previsti") +
+  autolayer(ts(df_validation, start =length(df_train)+1, end = length(df_validation)+length(df_train)+1,frequency = frequency(df_validation)), series="Valori Reali") +
+  scale_color_manual(values = c("#252850", "#C12869")) + 
+  theme_classic() +
+  xlab(" ") + 
+  ylab(" ") +
+  ggtitle("ARIMA con regressori")
+
+graph_reg
+```
+
+Da una prima valutazione qualitativa, la previsione risulta essere decisamente migliore rispetto al modello ARIMA senza regressori. 
+Vengono aggiunte anche le dummy in prossimità delle feste. 
+
+### ARIMA con regressori sinusoidali e dummy festività
+
+```{r}
+timeDate::listHolidays("IT")
+```
+
+
+```{r}
+capodanno <- as.Date(NewYearsDay(2010:2018))
+epifania <- as.Date(ITEpiphany(2010:2018))
+pasqua <- as.Date(c(Easter(2010:2018), EasterMonday(2010:2018)))
+aprile_25 <- as.Date(ITLiberationDay(2010:2018))
+maggio_1 <- as.Date(LaborDay(2010:2018))
+giugno_2 <- as.Date(paste0(2010:2018,"-06-02"))
+ferragosto <- as.Date(paste0(2010:2018,"-08-15"))
+santi <- as.Date(ITAllSaints(2010:2018))
+immaccolata <- as.Date(ITImmaculateConception(2010:2018))
+natale <- as.Date(c(ChristmasDay(2010:2018), ChristmasEve(2010:2018)))
+ultimo_anno <- as.Date(paste0(2010:2018,"-12-31"))
+```
+
+
+```{r}
+data.frame(Data=df$Data) %>%
+    mutate(Capodanno = as.numeric(Data %in% capodanno)) %>%
+    mutate(Epifania = as.numeric(Data %in% epifania)) %>%
+    mutate(Pasqua = as.numeric(Data %in% pasqua)) %>%
+    mutate(Liberazione = as.numeric(Data %in% aprile_25)) %>%
+    mutate(Lavoratori = as.numeric(Data %in% maggio_1)) %>%
+    mutate(Unita = as.numeric(Data %in% giugno_2)) %>%
+    mutate(Ferragosto = as.numeric(Data %in% ferragosto)) %>%
+    mutate(Santi = as.numeric(Data %in% santi)) %>%
+    mutate(Immaccolata = as.numeric(Data %in% immaccolata)) %>%
+    mutate(Natale = as.numeric(Data %in% natale)) %>%
+    mutate(Ultimo = as.numeric(Data %in% ultimo_anno)) %>%
+    select(-starts_with("Data")) %>% 
+    as.matrix() -> fest
+```
+
+```{r}
+all_reg <- as.matrix(cbind(sin,fest))
+```
+
+
+```{r}
+best_mod_reg_dum <- Arima(df_train, c(6,0,0), list(order=c(1,1,1), period=7), 
+              xreg=all_reg[1:(length(df_train)),], include.constant = TRUE, lambda = "auto")
+best_mod_reg_dum
+```
+
+```{r}
+previsioni_reg_dum <- forecast::forecast(best_mod_reg_dum, h=549, 
+              xreg=all_reg[(length(df_train)+1):(length(df_train)+549),])
+```
+
+```{r}
+reg_dum <- ggplot(ts(df_train["2010-01-01/2017-06-30"], start = 1, end = 2, frequency = frequency(df_train) )) +
+  autolayer(previsioni_reg_dum,series="Valori Previsti") +
+  autolayer(ts(df_validation, start =length(df_train)+1, end = length(df_validation)+length(df_train)+1,frequency = frequency(df_validation)), series="Valori Reali") +
+  scale_color_manual(values = c("#252850", "#C12869")) + 
+  theme_classic() +
+  xlab(" ") + 
+  ylab(" ") +
+  ggtitle("ARIMA con regressori e dummy")
+
+reg_dum
+```
+
+###  Confronto tra i 3 modelli ARIMA
+
+```{r warning=FALSE}
+print(paste0("ARIMA: ", round(best_mod$aic)))
+print(paste0("ARIMA con regressori: ", round(best_mod_reg$aic)))
+print(paste0("ARIMA con regressori e dummy: ", round(best_mod_reg_dum$aic)))
+```
+
+```{r, fig.height = 20, fig.width = 15}
+gridExtra::grid.arrange(graph_arima, graph_reg, reg_dum)
+```
+
+Sia da una analisi qualitativa dei grafici, sia dal confronto dell'AIC dei 3 modelli ARIMA sviluppati, emerge che il modello migliore è il modello $ARIMA(6,0,0)(1,1,1)_7$ sia con i regressori sinusoidali che le dummy relative alle festività. 
+Per concludere la procedura di Box-Jenkins, si analizzano i residui del modello risultato migliore. 
+
+### Analisi dei residui
+
+I residui di un modello ARIMA devono rispettare 3 ipotesi fondamentali: 
+- Normalità
+- Media nulla
+- Incorrelati
+
+```{r}
+Acf(best_mod_reg_dum$residuals, lag.max = 36)  
+Pacf(best_mod_reg_dum$residuals, lag.max = 36)
+```
+
+
+```{r}
+forecast::checkresiduals(best_mod_reg_dum)
+```
+I grafici in figura, permettono di dedurre che sembrerebbe che i residui abbiano media nulla poiché i valori oscillano attorno allo zero. Inoltre, dall'ultimo grafico si evince che seguono circa una distribuzione normale. 
+Il test di Ljung-Box che testa l'ipotesi di assenza di autocorrelazione globale, rifiuta l'ipotesi di assenza di autocorrelazione globale. Questo può succedere nel caso di dati reali poiché è molto difficile ottenere dei residui WN. Questo viene confermato dal fatto che in alcuni lag l'autocorrelazione rimane significativa.
+
+### Calcolo del MAPE del modello ARIMA
+
+```{r,include=T, warning=FALSE, message=FALSE}
+#MAPE ON TEST
+temp_forecast <- forecast::forecast(best_mod_reg_dum, h=334, xreg=all_reg[(length(df_train)):(length(df_train)+333),])
+score_arima <- c(mean(abs(temp_forecast$mean - df_validation[1:334])/df_validation[1:334]))
+
+for (i in 1:(length(df_validation) - 334)){
+    temp_mod <- forecast::Arima(c(df_train[i:length(df_train)],df_validation[1:i]), 
+                      model=best_mod_reg_dum, xreg=all_reg[i:(length(df_train)+i),])
+    temp_forecast <- forecast::forecast(temp_mod, h=334, xreg=all_reg[(length(df_train)+i+1):(length(df_train)+i+334),])$mean
+    score_arima <- c(score_arima, mean(abs(temp_forecast - df_validation[(i+1):(i+334)])/df_validation[(i+1):(i+334)]))
+}
+
+score_arima_validation <- round(mean(score_arima)*100,2)
+print(paste0("MAPE on validation: ", score_arima_validation))
+```
+
+```{r}
+#MAPE on training
+score_ARIMA_train <- round(mean(abs(best_mod_reg_dum$fitted-as.numeric(df_train))/as.numeric(df_train))*100,2)
+print(paste0("MAPE on training: ", score_ARIMA_train))
+```
+
+### Previsione 2019
+
+Di seguito vengono calcolate le previsioni degli 11 mesi successivi, dal 1° Gennaio 2019 al 30 Novembre 2019 tramite il modello $SARIMA(6,0,0)(1,1,1)_7$ con regressori stocastici e dummy in corrispondenza delle festività. 
+
+```{r}
+freq <- outer(1:(length(df_ts)+365), 1:18)*2*pi/365.25 
+
+cs   <- cos(freq)                   
+colnames(cs) <- paste("cos", 1:18)
+si   <- sin(freq)                   
+colnames(si) <- paste("cos", 1:18)
+
+more_reg <- as.matrix(cbind(cs,si))
+
+#more_reg <- as.matrix(cbind(more_reg, fest))
+
+mod_final_arima <- Arima(df_ts, c(6,1,6), list(order=c(1,1,1), period=7), 
+              xreg=more_reg[1:length(df_ts),], include.constant = TRUE, lambda = "auto")
+```
+
+```{r}
+previsioni_finali_arima <- forecast(mod_final_arima, h=334, xreg=more_reg[(length(df_ts)+1):(length(df_ts)+334),])
+```
+
+
+```{r}
+autoplot(previsioni_finali_arima) + 
+  scale_color_manual(values = c("#252850", "#C12869")) + 
+  theme_classic() +
+  xlab(" ") + 
+  ylab(" ") +
+  ggtitle("Previsioni con ARIMA(6,0,0)(1,1,1)[7]")
+```
+
+```{r}
+previsioni_arima <- previsioni_finali_arima$mean
+```
+
+
+
+## Modelli UCM
+
+Siccome le variabili dummy riferite alle festività inserite nei modelli precedenti hanno portato a miglioramenti nei modelli, sono state utilizzate anche per i modelli UCM. Per quanto riguarda le serie di seni e coseni, invece, non sono stati considerati per lo sviluppo dei modelli a componenti non osservabili. 
+
+Le componenti stagionali dummy sono state utilizzate per stimare la stagionalità settimanale mentre quelle trigonometrice per modellare quella intra-annua.  
+
+Per quanto riguarda il trend, invece, si testano il Local Linear Trend, il Random Walk e l'Integrated Random Walk. 
+
+### LLT con regressori
+
+```{r}
+train <- as.numeric(df_train)
+
+data.frame(Data=df$Data) %>%
+    mutate(Capodanno = as.numeric(as.numeric(Data %in% capodanno))) %>%
+    mutate(Epifania = as.numeric(as.numeric(Data %in% epifania))) %>%
+    mutate(Pasqua = as.numeric(as.numeric(Data %in% pasqua))) %>%
+    mutate(Liberazione = as.numeric(as.numeric(Data %in% aprile_25))) %>%
+    mutate(Lavoratori = as.numeric(as.numeric(Data %in% maggio_1))) %>%
+    mutate(Unita = as.numeric(as.numeric(Data %in% giugno_2))) %>%
+    mutate(Ferragosto = as.numeric(as.numeric(Data %in% ferragosto))) %>%
+    mutate(Santi = as.numeric(as.numeric(Data %in% santi))) %>%
+    mutate(Immaccolata = as.numeric(as.numeric(Data %in% immaccolata))) %>%
+    mutate(Natale = as.numeric(as.numeric(Data %in% natale))) %>%
+    mutate(Ultimo = as.numeric(as.numeric(Data %in% ultimo_anno))) %>%
+    select(-starts_with("Data")) -> more_reg
+```
+
+
+```{r}
+ucm_LLT <- SSModel(train ~ Capodanno + 
+                    Epifania + 
+                    Pasqua + 
+                    Liberazione +
+                    Lavoratori +
+                    Unita + 
+                    Ferragosto + 
+                    Santi + 
+                    Immaccolata + 
+                    Natale + 
+                    Ultimo +
+                    SSMtrend(2, list(NA,NA)) +
+                    SSMseasonal(7, NA, "dummy") + 
+                    SSMseasonal(365, NA, "trig", harmonics = 1:20),
+                    H = NA, 
+                    data = more_reg[1:length(train),])
+
+vary <- var(train, na.rm = TRUE) 
+ucm_LLT$P1inf <- ucm_LLT$P1inf * 0
+ucm_LLT$a1[1] <- mean(train, na.rm = TRUE)
+diag(ucm_LLT$P1) <- vary
+
+init <- numeric(5)
+init[1] <- log(vary/10)
+init[2] <- log(vary/10)
+init[3] <- log(vary/100) 
+init[4] <- log(vary/100) 
+init[5] <- log(vary/10)  
+
+update_fun <- function(pars, model){
+    model$Q[1, 1, 1] <- exp(pars[1])
+    model$Q[2, 2, 1] <- exp(pars[2])
+    model$Q[3, 3, 1] <- exp(pars[3])
+    diag(model$Q[4:43, 4:43, 1]) <- exp(pars[4])
+    model$H[1, 1, 1] <- exp(pars[5])
+    model
+}
+
+fit1 <- fitSSM(ucm_LLT, init, update_fun)
+print(fit1$optim.out$convergence)
+```
+
+
+```{r}
+data <- c(rep(NA, 334))
+temp_mod <- SSModel(data ~ Capodanno + 
+                           Epifania + 
+                           Pasqua + 
+                           Liberazione +
+                           Lavoratori +
+                           Unita + 
+                           Ferragosto + 
+                           Santi + 
+                           Immaccolata + 
+                           Natale + 
+                           Ultimo +  
+                           SSMtrend(2, list(fit1$model$Q[1,1,1],fit1$model$Q[2,2,1])) +
+                           SSMseasonal(7, fit1$model$Q[3,3,1], "dummy") +
+                           SSMseasonal(365, fit1$model$Q[4, 4, 1], "trig",
+                           harmonics = 1:20),
+                           H = fit1$model$H, 
+                           data=more_reg[(length(train)+1):(length(train)+334),])
+
+ucm_pred <- predict(fit1$model, newdata=temp_mod)[1:334]
+valid <- as.numeric(df_validation)[1:334]
+
+score_LLT_reg <- c(mean(abs(ucm_pred - valid)/valid))
+
+for (i in 1:(length(df_validation) - 334)){
+    data <- c(as.numeric(df_validation[1:i]), rep(NA, 334))
+    temp_mod <- SSModel(data ~ Capodanno + 
+                           Epifania + 
+                           Pasqua + 
+                           Liberazione +
+                           Lavoratori +
+                           Unita + 
+                           Ferragosto + 
+                           Santi + 
+                           Immaccolata + 
+                           Natale + 
+                           Ultimo +  
+                           SSMtrend(2, list(fit1$model$Q[1,1,1],fit1$model$Q[2,2,1])) +
+                           SSMseasonal(7, fit1$model$Q[3,3,1], "dummy") +
+                           SSMseasonal(365, fit1$model$Q[4, 4, 1], "trig",
+                           harmonics = 1:20),
+                           H = fit1$model$H, 
+                           data=more_reg[(length(train)+1):(length(train)+i+334),])
+    ucm_pred <- predict(fit1$model, newdata=temp_mod, n.ahead=334)[(i+1):(i+334)]
+    valid <- as.numeric(df_validation)[(i+1):(i+334)]
+    score_LLT_reg <- c(score_LLT_reg, mean(abs(ucm_pred - valid)/valid))
+}
+score_LLT_reg <- mean(score_LLT_reg)*100
+print(score_LLT_reg)
+
+```
+
+```{r}
+score_train_LLT_reg <- mean(abs(fitted(fit1$model) - as.numeric(train))/as.numeric(train)) * 100 #MAPE on training
+score_train_LLT_reg
+```
+
+```{r}
+ucm_LLT_graph <- ggplot() +
+                 autolayer(ts(valid), series="Valori reali",size=0.4) +
+                 autolayer(ts(ucm_pred, start=start(ts(valid)),
+                      frequency=frequency(ts(valid))),
+                      series="Valori previsti", size=0.4, alpha=0.7) +
+                 xlab("") +
+                 ylab("") + 
+                 ggtitle("UCM con LLT e Regressori") +
+                 scale_color_manual(values = c("#252850", "#C12869")) +
+                 theme_classic()
+
+ucm_LLT_graph
+```
+
+
+### LLT senza regressori
+
+```{r}
+ucm_LLT_noreg <- SSModel(train ~ SSMtrend(2, list(NA,NA)) +
+                    SSMseasonal(7, NA, "dummy") + 
+                    SSMseasonal(365, NA, "trig", harmonics = 1:20),
+                    H = NA)
+
+vary <- var(train, na.rm = TRUE)
+ucm_LLT_noreg$P1inf <- ucm_LLT_noreg$P1inf * 0
+ucm_LLT_noreg$a1[1] <- mean(train, na.rm = TRUE)
+diag(ucm_LLT_noreg$P1) <- vary
+
+
+init <- numeric(5)
+init[1] <- log(vary/10)
+init[2] <- log(vary/10)
+init[3] <- log(vary/100)
+init[4] <- log(vary/100)
+init[5] <- log(vary/10)
+
+update_fun <- function(pars, model){
+    model$Q[1, 1, 1] <- exp(pars[1])
+    model$Q[2, 2, 1] <- exp(pars[2])
+    model$Q[3, 3, 1] <- exp(pars[3])
+    diag(model$Q[4:43, 4:43, 1]) <- exp(pars[4])
+    model$H[1, 1, 1] <- exp(pars[5])
+    model
+}
+
+fit2 <- fitSSM(ucm_LLT_noreg, init, update_fun)
+print(fit2$optim.out$convergence)
+```
+
+
+```{r}
+data <- c(rep(NA, 334))
+temp_mod_noreg <- SSModel(data ~
+                           SSMtrend(2, list(fit1$model$Q[1,1,1],fit1$model$Q[2,2,1])) +
+                           SSMseasonal(7, fit1$model$Q[3,3,1], "dummy") +
+                           SSMseasonal(365, fit1$model$Q[4, 4, 1], "trig",
+                           harmonics = 1:20),
+                           H = fit2$model$H)
+
+ucm_pred <- predict(fit2$model, newdata=temp_mod_noreg)[1:334]
+valid <- as.numeric(df_validation)[1:334]
+
+score_LLT_noreg <- c(mean(abs(ucm_pred - valid)/valid))
+
+for (i in 1:(length(df_validation) - 334)){
+    data <- c(as.numeric(df_validation[1:i]), rep(NA, 334))
+    temp_mod_noreg <- SSModel(data ~ SSMtrend(2, list(fit2$model$Q[1,1,1],fit2$model$Q[2,2,1])) +
+                      SSMseasonal(7, fit2$model$Q[3,3,1], "dummy") +
+                      SSMseasonal(365, fit2$model$Q[4, 4, 1], "trig",
+                                  harmonics = 1:20),
+                    H = fit2$model$H)
+    ucm_pred <- predict(fit2$model, newdata=temp_mod_noreg)[(i+1):(i+334)]
+    valid <- as.numeric(df_validation)[(i+1):(i+334)]
+    score_LLT_noreg <- c(score_LLT_noreg,mean(abs(ucm_pred - valid)/valid))
+}
+
+score_LLT_noreg <- mean(score_LLT_noreg)*100
+print(score_LLT_noreg)
+```
+
+```{r}
+score_train_LLT_no_reg <- mean(abs(fitted(fit2$model) - as.numeric(train))/as.numeric(train)) * 100
+score_train_LLT_no_reg
+```
+
+```{r}
+ucm_LLT_noreg_graph <- ggplot() +
+                 autolayer(ts(valid), series="Valori reali",size=0.4) +
+                 autolayer(ts(ucm_pred, start=start(ts(valid)),
+                      frequency=frequency(ts(valid))),
+                      series="Valori previsti", size=0.4, alpha=0.7) +
+                 xlab("") +
+                 ylab("") + 
+                 ggtitle("UCM con LLT senza regressori") +
+                 scale_color_manual(values = c("#252850", "#C12869")) +
+                 theme_classic()
+
+ucm_LLT_noreg_graph
+```
+
+### Random walk
+
+```{r}
+ucm_RW <- SSModel(train ~ SSMtrend(1, NA) +
+                      SSMseasonal(7, NA, "dummy") +
+                      SSMseasonal(365, NA, "trig",
+                                  harmonics = 1:20),
+                H = NA)
+
+vary <- var(train, na.rm = TRUE)
+ucm_RW$P1inf <- ucm_RW$P1inf * 0
+ucm_RW$a1[1] <- mean(train, na.rm = TRUE)
+diag(ucm_RW$P1) <- vary
+
+init <- numeric(5)
+init[1] <- log(vary/10) 
+init[2] <- log(vary/100)
+init[3] <- log(vary/100)
+init[4] <- log(vary/10) 
+
+#funzione per fitSSM
+update_fun <- function(pars, model){
+    model$Q[1, 1, 1] <- exp(pars[1])
+    model$Q[2, 2, 1] <- exp(pars[2])
+    diag(model$Q[3:42, 3:42, 1]) <- exp(pars[3])
+    model$H[1, 1, 1] <- exp(pars[4])
+    model
+}
+
+fit3 <- fitSSM(ucm_RW, init, update_fun)
+print(fit3$optim.out$convergence)
+```
+
+```{r}
+data <- c(rep(NA, 334))
+temp_mod <- SSModel(data ~  SSMtrend(1, fit3$model$Q[1,1,1]) +
+                              SSMseasonal(7, fit3$model$Q[2,2,1], "dummy") +
+                              SSMseasonal(365, fit3$model$Q[3, 3, 1], "trig",
+                              harmonics = 1:20),
+                    H = fit3$model$H)
+ucm_RW_pred <- predict(fit3$model, newdata=temp_mod)[1:334]
+valid <- as.numeric(df_validation)[1:334]
+
+score_RW <- c(mean(abs(ucm_RW_pred - valid)/valid))
+
+for (i in 1:(length(df_validation) - 334)){
+    data <- c(as.numeric(df_validation[1:i]), rep(NA, 334))
+    temp_mod <- SSModel(data ~  SSMtrend(1, fit3$model$Q[1,1,1]) +
+                          SSMseasonal(7, fit3$model$Q[2,2,1], "dummy") +
+                          SSMseasonal(365, fit3$model$Q[3, 3, 1], "trig",
+                              harmonics = 1:20),
+                        H = fit3$model$H)
+    ucm_RW_pred <- predict(fit3$model, newdata=temp_mod)[(i+1):(i+334)]
+    valid <- as.numeric(df_validation)[(i+1):(i+334)]
+    score_RW <- c(score_RW,mean(abs(ucm_RW_pred - valid)/valid))
+}
+
+score_RW <- mean(score_RW)*100
+print(score_RW)
+```
+
+
+```{r}
+score_train_RW <- mean(abs(fitted(fit3$model) - as.numeric(train))/as.numeric(train)) * 100
+score_train_RW
+```
+
+```{r}
+ucm_RW_graph <- ggplot() +
+                 autolayer(ts(valid), series="Valori reali",size=0.4) +
+                 autolayer(ts(ucm_pred, start=start(ts(valid)),
+                      frequency=frequency(ts(valid))),
+                      series="Valori previsti", size=0.4, alpha=0.7) +
+                 xlab("") +
+                 ylab("") + 
+                 ggtitle("UCM con RW") +
+                 scale_color_manual(values = c("#252850", "#C12869")) +
+                 theme_classic()
+
+ucm_RW_graph
+```
+
+### Integrated Random Walk
+
+```{r}
+ucm_mod_IRW <- SSModel(train ~ SSMtrend(2, list(0,NA)) +
+                      SSMseasonal(7, NA, "dummy") +
+                      SSMseasonal(365, NA, "trig",
+                                  harmonics = 1:20),
+                H = NA)
+
+vary <- var(train, na.rm = TRUE)
+ucm_mod_IRW$P1inf <- ucm_mod_IRW$P1inf * 0
+ucm_mod_IRW$a1[1] <- mean(train, na.rm = TRUE)
+diag(ucm_mod_IRW$P1) <- vary
+
+
+
+#valori iniziali delle varianze
+init <- numeric(5)
+init[1] <- 0
+init[2] <- log(vary/10) 
+init[3] <- log(vary/100)
+init[4] <- log(vary/100)
+init[5] <- log(vary/10) 
+
+#funzione per fitSSM
+update_fun <- function(pars, model){
+    model$Q[1, 1, 1] <- exp(pars[1])
+    model$Q[2, 2, 1] <- exp(pars[2])
+    model$Q[3, 3, 1] <- exp(pars[3])
+    diag(model$Q[4:43, 4:43, 1]) <- exp(pars[4])
+    model$H[1, 1, 1] <- exp(pars[5])
+    model
+}
+
+fit4 <- fitSSM(ucm_mod_IRW, init, update_fun)
+print(fit4$optim.out$convergence)
+```
+
+
+```{r}
+data <- c(rep(NA, 334))
+temp_mod <- SSModel(data ~  SSMtrend(2, list(0,fit4$model$Q[2,2,1])) +
+                      SSMseasonal(7, fit4$model$Q[3,3,1], "dummy") +
+                      SSMseasonal(365, fit4$model$Q[4, 4, 1], "trig",
+                              harmonics = 1:20),
+                    H = fit4$model$H)
+ucm_pred_IRW <- predict(fit4$model, newdata=temp_mod)[1:334]
+valid <- as.numeric(df_validation)[1:334]
+
+score_IRW <- c(mean(abs(ucm_pred_IRW - valid)/valid))
+
+for (i in 1:(length(df_validation) - 334)){
+    data <- c(as.numeric(df_validation[1:i]), rep(NA, 334))
+    temp_mod <- SSModel(data ~ SSMtrend(2, list(0,fit4$model$Q[2,2,1])) +
+                      SSMseasonal(7, fit4$model$Q[3,3,1], "dummy") +
+                      SSMseasonal(365, fit4$model$Q[4, 4, 1], "trig",
+                                  harmonics = 1:20),
+                    H = fit4$model$H)
+    ucm_pred_IRW <- predict(fit4$model, newdata=temp_mod)[(i+1):(i+334)]
+    valid <- as.numeric(df_validation)[(i+1):(i+334)]
+    score_IRW <- c(score_IRW,mean(abs(ucm_pred_IRW - valid)/valid))
+}
+
+score_IRW<- mean(score_IRW)*100
+print(score_IRW)
+```
+
+```{r}
+score_train_IRW <- mean(abs(fitted(fit4$model) - as.numeric(train))/as.numeric(train)) * 100
+score_train_IRW
+```
+
+```{r}
+ucm_IRW_graph <- ggplot() +
+                 autolayer(ts(valid), series="Valori reali",size=0.4) +
+                 autolayer(ts(ucm_pred, start=start(ts(valid)),
+                      frequency=frequency(ts(valid))),
+                      series="Valori previsti", size=0.4, alpha=0.7) +
+                 xlab("") +
+                 ylab("") + 
+                 ggtitle("UCM con IRW") +
+                 scale_color_manual(values = c("#252850", "#C12869")) +
+                 theme_classic()
+
+ucm_IRW_graph
+```
+
+```{r}
+print(paste0("MAPE UCM model with LLT with regressors on train: ", round(score_train_LLT_reg, 2)))
+print(paste0("MAPE UCM model with LLT without regressors on train: ", round(score_train_LLT_no_reg, 2)))
+print(paste0("MAPE UCM model with RW on train: ", round(score_train_RW, 2)))
+print(paste0("MAPE UCM model with IRW on train: ", round(score_train_IRW, 2)))
+```
+
+
+```{r}
+print(paste0("MAPE UCM model with LLT with regressors on validation: ", round(score_LLT_reg, 2)))
+print(paste0("MAPE UCM model with LLT without regressors on validation: ", round(score_LLT_noreg, 2)))
+print(paste0("MAPE UCM model with RW on validation: ", round(score_RW, 2)))
+print(paste0("MAPE UCM model with IRW on validation: ", round(score_IRW,2)))
+```
+
+```{r, fig.height = 20, fig.width = 25}
+#gridExtra::grid.arrange(ucm_LLT_graph, ucm_LLT_noreg_graph, ucm_RW_graph, ucm_IRW_graph, ncol = 2)
+```
+
+
+```{r}
+smo3 <- KFS(fit3$model, 
+            smoothing = c("disturbance",
+                          "signal")) 
+
+dist3 <- rstandard(smo3, "state")
+# si selezionano l'errore dell'evoluzione del livello, dello slope e di una stagionalità
+plot(dist3[,c(1,2,15)], main= "Disturbance smoother", col="#252850")
+```
+
+```{r}
+err_oss <- rstandard(smo3, "pearson")
+plot(err_oss, main = "Errore di osservazione", ylab = "Errore di Osservazione", col= "#252850")
+```
+In quest'ultimo grafico vengono visualizzate qualche osservazione anomala poiché fuori dalle bande in corrispondenza di +3/-3. Siccome sono un numero relativamente basso di osservazioni, non è necessaria la creazione di dummy utili a modellare gli shock. 
+
+### Previsione del modello UCM
+
+```{r}
+train <- df[, -c(3,4)]
+test <- data.frame(Data=seq(as.Date("2019-01-01"), as.Date("2019-11-30"), by="day"), value=NA)
+ucm_test <- rbind(train, test)
+df_train_ucm <- xts(ucm_test$value, order.by = ucm_test$Data)
+```
+
+```{r}
+df_train_ucm <- as.numeric(df_train_ucm)
+
+best_ucm <- SSModel(df_train_ucm ~ SSMtrend(2, list(0,NA)) +
+                      SSMseasonal(7, NA, "dummy") +
+                      SSMseasonal(365, NA, "trig",
+                                  harmonics = 1:20),
+                H = NA)
+
+vary <- var(df_train_ucm, na.rm = TRUE)
+best_ucm$P1inf <- best_ucm$P1inf * 0
+best_ucm$a1[1] <- mean(df_train_ucm, na.rm = TRUE)
+diag(best_ucm$P1) <- vary
+
+
+
+#valori iniziali delle varianze
+init <- numeric(5)
+init[1] <- 0
+init[2] <- log(vary/10) 
+init[3] <- log(vary/100)
+init[4] <- log(vary/100)
+init[5] <- log(vary/10) 
+
+#funzione per fitSSM
+update_fun <- function(pars, model){
+    model$Q[1, 1, 1] <- exp(pars[1])
+    model$Q[2, 2, 1] <- exp(pars[2])
+    model$Q[3, 3, 1] <- exp(pars[3])
+    diag(model$Q[4:43, 4:43, 1]) <- exp(pars[4])
+    model$H[1, 1, 1] <- exp(pars[5])
+    model
+}
+
+fit_finale <- fitSSM(best_ucm, init, update_fun, control = list(maxit = 1000))
+print(fit_finale$optim.out$convergence)
+```
+
+```{r}
+smo_best_mod <- KFS(fit_finale$model, 
+            filtering = "signal")
+
+ucm_test_value <- smo_best_mod$m[(length(df_train_ucm)-333):length(df_train_ucm)]
+```
+
+
+## Modelli non lineari
+
+### KNN
+
+
+```{r}
+ts <- ts(df$value, frequency = 7)
+ts_train = ts[1:2738]
+ts_test = ts[2739:3287]
+```
+
+```{r}
+d <- seq(5, 100, 5)
+score <- c()
+
+for (i in d){
+    mod <- knn_forecasting(ts_train, h = 549, lags = 1:365, k = i, msas = "recursive")
+    pred <- mod$pred
+    single_score <- mean(abs(pred - ts_test)/ts_test)
+    score <- append(score, single_score)
+
+}
+```
+
+```{r}
+#stima del modello migliore
+mod <- knn_forecasting(ts_train, h = 549, lags = 1:365,  k = 35, msas = "recursive")
+pred <- mod$pred
+score_mod <- mean(abs(pred - ts_test)/ts_test)
+paste0("MAPE KNN con k=35: ", round(score_mod, 4))
+```
+
+### LSTM
+
+```{r, warning=FALSE}
+time_series_dataset <- read.csv("C:/Users/FedericaFiorentini/Desktop/time_series_dataset.csv", sep=";")
+
+time_series_dataset$Data = as.Date(time_series_dataset$Data)
+
+time_series_dataset1 <- time_series_dataset[-c(759, 2551),]
+
+df_train <- time_series_dataset1[1:2555,] 
+df_val <- time_series_dataset1[2556:3285,] 
+
+df <- bind_rows(
+    df_train %>% add_column(key = "training"),
+    df_val %>% add_column(key = "validation")) 
+
+rec_obj <- recipe(value ~ ., df) %>%
+    step_sqrt(value) %>%
+    step_center(value) %>%
+    step_scale(value) %>%
+    prep()
+
+df_scaled <- bake(rec_obj, df)
+
+center_history <- rec_obj$steps[[2]]$means["value"]
+scale_history  <- rec_obj$steps[[3]]$sds["value"]
+
+c("center" = center_history, "scale" = scale_history)
+```
+
+```{r}
+batch_size   <- 365     
+tsteps       <- 1
+epochs       <- 200
+
+# Training 
+train_lag <- df_scaled %>%
+    mutate(value_lag = lag(value, 365)) %>%
+    filter(!is.na(value_lag)) %>%
+    filter(key == "training") 
+
+
+x_train <- array(data = train_lag$value_lag, dim = c(length(train_lag$value_lag), tsteps, 1))
+
+y_train <- array(data = train_lag$value, dim = c(length(train_lag$value), tsteps))
+
+# Validation 
+val_lag <- df_scaled%>%
+    mutate(value_lag = lag(value, 365)) %>%
+    filter(!is.na(value_lag)) %>%
+    filter(key == "validation")
+ 
+x_val <- array(data = val_lag$value_lag, dim = c(length(val_lag$value_lag), tsteps, 1))
+
+y_val <- array(data = val_lag$value, dim = c(length(val_lag$value), tsteps))
+```
+
+```{r, warning=FALSE}
+mod_lstm1 <- keras_model_sequential()
+
+mod_lstm1 %>%
+    layer_lstm(units            = 90, 
+               input_shape      = c(tsteps, 1), 
+               batch_size       = batch_size,
+               return_sequences = TRUE, 
+               stateful         = TRUE) %>% 
+    layer_lstm(units            = 90, 
+               return_sequences = FALSE, 
+               stateful         = TRUE) %>% 
+    layer_dense(units = 1) 
+
+mod_lstm1 %>% 
+    compile(loss = 'mae', optimizer = 'adam')
+
+mod_lstm1
+```
+
+
+```{r, warning=FALSE}
+for (i in 1:epochs) {
+    mod_lstm1 %>% fit(x= x_train, 
+                  y = y_train, 
+                  batch_size = batch_size,
+                  epochs     = 1, 
+                  verbose    = 1, 
+                  shuffle    = FALSE)
+    cat("Epoch: ", i)}
+```
+
+
+```{r}
+pred_lstm1_scaled<- mod_lstm1 %>% 
+    predict(x_val, batch_size = batch_size) %>%
+    .[,1] 
+
+# Trasformazione inversa
+pred_lstm1 <- tibble(
+    Data   = val_lag$Data,
+    value   = (pred_lstm1_scaled * scale_history + center_history)^2) 
+
+
+ggplot() +
+  autolayer(ts(df_val$value), series="Validation",size=0.4) +
+  autolayer(ts(pred_lstm1$value),
+                  series="Previsione", size=0.4)+
+  xlab("") +
+  ylab("")+
+  scale_color_manual(values = c("#252850", "#C12869"))+
+  theme_classic()
+```
+
+```{r}
+mape_lstm1 <- mean(abs(as.numeric(pred_lstm1$value) - as.numeric(df_val$value))/as.numeric(df_val$value))
+mape_lstm1
+```
+
+### GRU
+
+```{r}
+mod_gru1 <- keras_model_sequential()
+
+mod_gru1 %>%
+    layer_gru(units  = 90, 
+               input_shape = c(tsteps, 1), 
+               batch_size  = batch_size,
+              dropout=0.3, recurrent_dropout=0.5) %>% 
+    layer_dense(units = 1, activation = "linear") 
+
+mod_gru1 %>% 
+    compile(loss = 'mae', optimizer = 'adam') #adam
+
+mod_gru1
+```
+
+```{r}
+for (i in 1:epochs) {
+    mod_gru1 %>% fit(x  = x_train, 
+                  y    = y_train, 
+                  batch_size = batch_size,
+                  epochs     = 1, 
+                  verbose    = 1, 
+                  shuffle    = FALSE)
+
+    cat("Epoch: ", i)
+    
+}
+```
+
+```{r}
+pred_gru1_scaled <- mod_gru1 %>% 
+    predict(x_val, batch_size = batch_size) %>%
+    .[,1] 
+
+# Trasformazione inversa
+pred_gru1 <- tibble(
+    Data   = val_lag$Data,
+    value   = (pred_gru1_scaled * scale_history + center_history)^2) 
+
+
+ggplot() +
+  autolayer(ts(df_val$value), series="Validation",size=0.4) +
+  autolayer(ts(pred_gru1$value),
+                  series="Previsione", size=0.4)+
+  xlab("") +
+  ylab("")+
+  scale_color_manual(values = c("#252850", "#C12869"))+
+  theme_classic()
+```
+
+```{r}
+# MAPE validation
+mape_gru1 <- mean(abs(as.numeric(pred_gru1$value) - as.numeric(df_val$value))/as.numeric(df_val$value))
+mape_gru1
+```
+
+### Previsioni
+
+```{r}
+df_train_all <- time_series_dataset1
+
+rec_obj2 <- recipe(value ~ ., df_train_all) %>%
+    step_sqrt(value) %>%
+    step_center(value) %>%
+    step_scale(value) %>%
+    prep()
+
+df_train_all_scaled<- bake(rec_obj2, df_train_all)
+
+# si salvano i valori per effettuare la trasformaizone inversa a seguito della previsione
+
+center_history <- rec_obj2$steps[[2]]$means["value"]
+scale_history  <- rec_obj2$steps[[3]]$sds["value"]
+
+train_all_lag <- df_train_all_scaled %>%
+    mutate(value_lag = lag(value, 365)) %>%
+    filter(!is.na(value_lag)) 
+
+
+x_train_all <- array(data = train_all_lag$value_lag, dim = c(length(train_all_lag$value_lag), tsteps, 1))
+
+
+y_train_all <- array(data = train_all_lag$value, dim = c(length(train_all_lag$value), tsteps))
+```
+
+
+```{r}
+mod_gru1 <- keras_model_sequential()
+
+mod_gru1 %>%
+    layer_gru(units  = 90, 
+               input_shape = c(tsteps, 1), 
+               batch_size  = batch_size,
+              dropout=0.3, recurrent_dropout=0.5) %>% 
+    layer_dense(units = 1) 
+
+mod_gru1 %>% 
+    compile(loss = 'mae', optimizer = 'adam') #adam
+
+mod_gru1
+```
+
+
+```{r}
+for (i in 1:epochs) {
+    mod_gru1 %>% fit(x  = x_train_all, 
+                  y    = y_train_all, 
+                  batch_size = batch_size,
+                  epochs     = 1, 
+                  verbose    = 1, 
+                  shuffle    = FALSE)
+
+    cat("Epoch: ", i)
+    
+}
+```
+
+```{r}
+x_2018 <- df_train_all_scaled[2921:3285,]
+x_2018_arr <- array(data = x_2018$value, dim = c(length(x_2018$value), tsteps, 1))
+```
+
+
+```{r}
+# Previsioni
+final_pred_gru1_scaled <- mod_gru1 %>% 
+    predict(x_2018_arr, batch_size = batch_size) %>%
+    .[,1] 
+
+# Trasformazione inversa
+final_pred_gru1 <- tibble(
+    Data   = seq(from = as.Date('2019-01-01'), to=as.Date('2019-12-31'), by = 1),
+    value   = (final_pred_gru1_scaled * scale_history + center_history)^2) 
+
+final_pred_gru1 <- final_pred_gru1[1:334,]
+
+```
+
+
+### Confronti tra i modelli migliori
+
+Tra la categoria ARIMA, il modello migliore risulta essere $ARIMA(6,0,0)(1,1,1)_7$ con i regressori sinusoidali e le dummy stocastiche in corrispondenza delle festività. Per la categoria UCM, invece, il modello migliore è quello con il trend modellato tramite l'integrated random walk. Infine, per i modelli di Machine Learining, il modello più performante è il KNN. 
+
+Di seguito vengono rappresentati i grafici delle previsioni dei tre modelli con i relativi MAPE calcolati sul validation set. 
+
+```{r}
+g1 <- ggplot() +
+  autolayer(ts(df_ts), series="Serie originale",size=0.4) +
+  autolayer(ts(previsioni_arima, start = length(df_ts)+1), series="Previsione ARIMA", size=0.4)+
+  xlab("") +
+  ylab("")+
+  scale_color_manual(values=c("#252850", "#C12869"))+
+  theme_classic()
+
+g2 <- ggplot() +
+  autolayer(ts(df_ts), series="Serie originale",size=0.4) +
+  autolayer(ts(ucm_test_value, start = length(df_ts)+1) , series="Previsione UCM", size=0.4)+
+  xlab("") +
+  ylab("")+
+  scale_color_manual(values=c("#252850", "#C12869"))+
+  theme_classic()
+
+g3 <- ggplot() +
+  autolayer(ts(df_ts), series="Serie originale",size=0.4) +
+  autolayer(ts(final_pred_gru1$value, start = length(df_ts)+1) , series="Previsione ML", size=0.4)+
+  xlab("") +
+  ylab("")+
+  scale_color_manual(values=c("#252850", "#C12869"))+
+  theme_classic()
+```
+
+```{r}
+gridExtra::grid.arrange(g1, g2, g3, ncol = 2, nrow = 2)
+```
+
+Previsioni finali: 
+
+```{r}
+previsioni_all<- final_pred_gru1 %>% 
+  mutate(ARIMA = as.numeric(previsioni_arima) ) %>%
+  mutate(UCM = ucm_test_value) %>%
+  select(Data, ARIMA, UCM, ML = value)
+
+write.csv(previsioni_all, file="SDMTSA_807124_1.csv", row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
